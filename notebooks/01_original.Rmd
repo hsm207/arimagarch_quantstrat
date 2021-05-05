@@ -1,0 +1,212 @@
+---
+title: "ARIMA+GARCH Trading Strategy on the S&P500 Stock Market Index Using R"
+output: 
+  html_notebook: 
+    toc: yes
+---
+
+# Source
+
+[ARIMA+GARCH Trading Strategy on the S&P500 Stock Market Index Using R](https://www.quantstart.com/articles/ARIMA-GARCH-Trading-Strategy-on-the-SP500-Stock-Market-Index-Using-R/)
+
+# Libraries
+
+```{r include=FALSE}
+install.packages("quantmod")
+install.packages("lattice")
+install.packages("timeSeries")
+install.packages("rugarch")
+install.packages("reticulate")
+```
+
+```{r}
+library(quantmod)
+library(lattice)
+library(timeSeries)
+library(rugarch)
+
+library(reticulate)
+```
+
+
+# Data
+
+Get the differenced logarithmic return of the closing price of the S&P 500:
+
+```{r}
+# getSymbols("^GSPC", from="1950-01-01")
+getSymbols("^GSPC", from="2017-01-01")
+spReturns = diff(log(Cl(GSPC)))
+spReturns[as.character(head(index(Cl(GSPC)),1))] = 0
+```
+
+A vector to store the forecast of each day:
+
+```{r}
+windowLength = 500
+foreLength = length(spReturns) - windowLength
+forecasts <- vector(mode="character", length=foreLength)
+```
+
+# Prediction
+
+Loop through each each to generate predictions based on window of length `windowLength`:
+
+```{r}
+for (d in 0:foreLength) {
+  # vector of returns to fit the model
+  spReturnsOffset = spReturns[(1 + d):(windowLength + d)]
+  
+  final.aic <- Inf
+  final.order <- c(0, 0, 0)
+  
+  # for ther arima model, set d = 0, and try p = 0..5
+  # and q = 0..5 but never p = q = 0
+  for (p in 0:5)
+    for (q in 0:5) {
+      if (p == 0 && q == 0) {
+        next
+      }
+      
+      # fit an arima model
+      arimaFit = tryCatch(
+        arima(spReturnsOffset, order = c(p, 0, q)),
+        error = function(err)
+          FALSE,
+        warning = function(err)
+          FALSE
+      )
+      
+      # if have an arimafit, check if it has the best AIC
+      if (!is.logical(arimaFit)) {
+        current.aic <- AIC(arimaFit)
+        if (current.aic < final.aic) {
+          final.aic <- current.aic
+          final.order <- c(p, 0, q)
+          final.arima <-
+            arima(spReturnsOffset, order = final.order)
+        }
+      } else {
+        next
+      }
+    }
+  
+  # Specify and fit the GARCH(1,1) model
+  spec = ugarchspec(
+    variance.model = list(garchOrder = c(1, 1)),
+    mean.model = list(
+      armaOrder = c(final.order[1], final.order[3]),
+      include.mean = T
+    ),
+    distribution.model = "sged"
+  )
+  
+  fit = tryCatch(
+    ugarchfit(spec, spReturnsOffset, solver = 'hybrid'),
+    error = function(e)
+      e,
+    warning = function(w)
+      w
+  )
+  
+  # If we can't fit a model, predict "1"
+  
+  if (is(fit, "warning")) {
+    forecasts[d + 1] = paste(index(spReturnsOffset[windowLength]), 1, sep =
+                               ",")
+    print(paste(index(spReturnsOffset[windowLength]), 1, sep = ","))
+  } else {
+    # otherwise, if forecasted return less than 0, return -1 else +1
+    fore = ugarchforecast(fit, n.ahead = 1)
+    ind = fore@forecast$seriesFor
+    forecasts[d + 1] = paste(colnames(ind), ifelse(ind[1] < 0,-1, 1), sep =
+                               ",")
+    print(paste(colnames(ind), ifelse(ind[1] < 0,-1, 1), sep = ","))
+  }
+  
+}
+   
+   
+```
+# Save the results
+
+Save the forecast vector for further analysis.
+
+Note: The full results from the article can be downloaded [here](https://s3.amazonaws.com/quantstartmedia/data/forecasts_new.csv).
+
+```{r}
+ write.csv(forecasts, file="forecasts_test.csv", row.names=FALSE)
+```
+
+
+Adjust the signal:
+
+
+```{python}
+forecasts = open("forecasts_test.csv", "r").readlines()
+
+old_value = 1
+new_list = []
+for f in forecasts[1:]:
+    strpf = f.replace('"','').strip()
+    new_str = "%s,%s\n" % (strpf, old_value)
+    newspl = new_str.strip().split(",")
+    final_str = "%s,%s\n" % (newspl[0], newspl[2])
+    final_str = final_str.replace('"','')
+    old_value = f.strip().split(',')[1]
+    new_list.append(final_str)
+
+out = open("forecasts_new.csv", "w")
+for n in new_list:
+    out.write(n)
+    
+out.close()
+```
+
+
+# Analytics
+
+Read the saved results:
+
+```{r}
+
+spArimaGarch = as.xts(read.zoo(
+  file = "forecasts_new.csv",
+  format = "%Y-%m-%d",
+  header = F,
+  sep = ","
+))
+```
+
+Join the returns data:
+
+```{r}
+spIntersect = merge(spArimaGarch[, 1], spReturns, all = F)
+spArimaGarchReturns = spIntersect[, 1] * spIntersect[, 2]
+```
+
+Buy and hold as a benchmark:
+
+```{r}
+spArimaGarchCurve = log(cumprod(1 + spArimaGarchReturns))
+spBuyHoldCurve = log(cumprod(1 + spIntersect[, 2]))
+spCombinedCurve = merge(spArimaGarchCurve, spBuyHoldCurve, all = F)
+```
+
+Visualize:
+
+```{r}
+xyplot(
+  spCombinedCurve,
+  superpose = T,
+  col = c("darkred", "darkblue"),
+  lwd = 2,
+  key = list(text = list(c(
+    "ARIMA+GARCH", "Buy & Hold"
+  )),
+  lines = list(
+    lwd = 2, col = c("darkred", "darkblue")
+  ))
+)
+```
+
