@@ -1,0 +1,446 @@
+---
+title: "ARIMA+GARCH Trading Strategy on the S&P500 Stock Market Index Using quantstrat"
+output:
+  html_document:
+    toc: yes
+    df_print: paged
+  html_notebook:
+    toc: yes
+---
+
+# Libraries
+
+Load required libraries:
+
+```{r echo = T, results = 'hide'}
+library(tidyquant)
+library(lattice)
+
+library(timetk)
+library(forecast)
+library(rugarch)
+library(broom)
+
+library(quantstrat)
+library(tidyverse)
+```
+
+Print some system info to help with reproducibility:
+
+```{r}
+sessionInfo()
+```
+# Data
+
+Get data for the S&P 500 and compute its log returns:
+
+```{r}
+start_date <- "2017-01-01"
+end_date <- "2021-05-02"
+# end_date <- "2017-06-15"
+
+stock_ticker <- "SPY"
+
+df <-  tq_get(stock_ticker,
+              get = "stock.prices",
+              from = start_date,
+              to = end_date) %>%
+  tq_mutate(
+    select = close,
+    mutate_fun = dailyReturn,
+    type = "log",
+    col_rename = "daily_return"
+  ) %>%
+  select(-symbol)
+
+df %>%
+  head(5)
+```
+
+# Strategy Setup
+
+Parameters related to the backtest:
+
+```{r}
+# window size to compute rolling ARIMA+GARCH indicator
+window_size <- 500
+# window_size <- 100
+
+# date to start the backtest
+init_date <- "2016-12-31"
+
+# starting equity
+init_equity <- 1e6
+
+# total units per long/short position
+max_position <- trunc(init_equity/(df %>% head(1) %>% pull(close)))
+
+# units to long/short position
+pos_per_signal <- trunc(max_position/2)
+# pos_per_signal <- max_position
+```
+
+Parameters related to the security:
+
+```{r}
+currency("USD")
+```
+
+One way to get quantstrat access to the data is to assign it to the variable named as the ticker symbol in the global environment:
+
+```{r}
+df %>%
+  # quantstrat expects data to be in xts
+  tk_xts(date_var = date, select = -date) %>%
+  assign(stock_ticker, ., envir = .GlobalEnv)
+  
+stock(stock_ticker, currency = "USD", multiplier = 1)
+
+SPY %>%
+  head(5)
+```
+Initialize some objects related to quantstrat:
+
+```{r}
+portfolio.st <- "Port.ARIMA+GARCH"
+account.st <- "Acct.ARIMA+GARCH"
+strategy.st <- "Strat.ARIMA+GARCH"
+
+rm.strat(portfolio.st)
+rm.strat(account.st)
+
+
+initAcct(
+  name = account.st,
+  portfolios = portfolio.st,
+  initDate = init_date,
+  initEq = init_equity
+)
+
+
+initPortf(name = portfolio.st,
+          symbols = stock_ticker,
+          initDate = init_date)
+
+addPosLimit(portfolio.st, stock_ticker, init_date, maxpos = max_position)
+
+
+initOrders(portfolio = portfolio.st,
+           symbols = stock_ticker,
+           initDate = init_date)
+
+strategy(strategy.st, store = TRUE)
+
+
+```
+
+# ARIMA+GARCH Indicator
+
+Functions to help compute the ARIMA+GARCH indicator:
+
+```{r}
+
+find_best_arma_order <- function(x) {
+  arima.model <- auto.arima(
+    x,
+    d = 0,
+    max.p = 5,
+    max.q = 5,
+    ic = "aic",
+    seasonal = FALSE,
+    parallel = TRUE,
+    stepwise = FALSE
+  )
+  
+  best.ar.order <- arima.model$arma[1]
+  best.ma.order <- arima.model$arma[2]
+  
+  return(list(ar = best.ar.order, ma = best.ma.order))
+}
+
+
+fit_garch_11_model <- function(x, ar.order, ma.order) {
+  garchspec = ugarchspec(
+    variance.model = list(garchOrder = c(1, 1)),
+    mean.model = list(
+      armaOrder = c(ar.order, ma.order),
+      include.mean = T
+    ),
+    distribution.model = "sged"
+  )
+  
+  garch.model <- tryCatch(
+    ugarchfit(garchspec, x, solver = 'hybrid'),
+    warning = function(w)
+      w
+  )
+  
+  return(garch.model)
+}
+
+compute_arima_garch_indicator <- function(x) {
+  arma_order <- find_best_arma_order(x)
+  garch_model <- fit_garch_11_model(x, arma_order$ar, arma_order$ma)
+  
+  if (is(garch_model, "warning")) {
+    window_range <- range(index(x))
+    str_interp("Problem encountered in window ${window_range[1]} to ${window_range[2]}\n") %>%
+      warning
+    
+    return(1)
+  } else{
+   
+    arima_garch_indicator <-
+      ugarchforecast(garch_model, n.ahead = 1)@forecast$seriesFor %>%
+      map_dbl( ~ if_else(.x < 0,-1, 1))
+    
+    return(arima_garch_indicator)
+    
+  }
+  
+}
+
+
+```
+Function to compute the indicator that can be passed to quantstrat:
+
+```{r}
+rolling_arima_garch_indicator <- function(x, n = 500, col_name = "daily_return") {
+  results <- tk_tbl(x, rename_index = "date") %>%
+    tq_mutate(select = col_name,
+              mutate_fun = rollapply,
+              width = n,
+              FUN = compute_arima_garch_indicator,
+              col_rename = "arima_garch_indicator"
+              ) %>%
+    tk_xts(select = "arima_garch_indicator", date_var = "date")
+  
+  return(results)
+  
+}
+
+```
+
+
+Add the indicator to the backtest:
+
+```{r}
+add.indicator(
+  strategy = strategy.st,
+  name = "rolling_arima_garch_indicator",
+  arguments = list(x = quote(mktdata),
+                   col_name = "daily_return",
+                   n = window_size),
+  label = "arima_garch_indicator"
+)
+```
+
+# Signal
+
+Signals for when to go long or short:
+
+```{r}
+add.signal(
+  strategy = strategy.st,
+  name = "sigThreshold",
+  arguments = list(
+    column = "arima_garch_indicator",
+    threshold = 1,
+    relationship = "eq"
+  ),
+  label = "long"
+)
+
+add.signal(
+  strategy = strategy.st,
+  name = "sigThreshold",
+  arguments = list(
+    column = "arima_garch_indicator",
+    threshold = -1,
+    relationship = "eq"
+  ),
+  label = "short"
+)
+```
+
+# Buy/Sell Rules
+
+```{r}
+# buy to open
+add.rule(
+  strategy = strategy.st,
+  name = "ruleSignal",
+  arguments = list(
+    sigcol = "long",
+    sigval = TRUE,
+    orderqty = pos_per_signal,
+    ordertype = "stoplimit",
+    orderside = "long",
+    threshold = 0.0005,
+    prefer = "Open",
+    replace = FALSE,
+    osFUN=osMaxPos
+  ),
+  type = "enter",
+  label = "EnterLONG"
+)
+
+# sell to open
+add.rule(
+  strategy = strategy.st,
+  name = "ruleSignal",
+  arguments = list(
+    sigcol = "short",
+    sigval = TRUE,
+    orderqty = -pos_per_signal,
+    ordertype = "stoplimit",
+    orderside = "short",
+    threshold = 0.0005,
+    prefer = "Open",
+    replace = FALSE,
+    osFUN=osMaxPos
+  ),
+  type = "enter",
+  label = "EnterSHORT",
+
+)
+
+# sell to close
+add.rule(
+  strategy.st,
+  name = "ruleSignal",
+  arguments = list(
+    sigcol = "short",
+    sigval = TRUE,
+    orderside = "long",
+    ordertype = "market",
+    orderqty = "all",
+    replace = TRUE 
+  ),
+  type = "exit",
+  label = "Exit2SHORT"
+)
+
+# buy to close
+add.rule(
+  strategy.st,
+  name = "ruleSignal",
+  arguments = list(
+    sigcol = "long",
+    sigval = TRUE,
+    orderside = "short",
+    ordertype = "market",
+    orderqty = "all",
+    replace = TRUE
+  ),
+  type = "exit",
+  label = "Exit2LONG"
+)
+
+```
+
+# Backtest!
+
+```{r}
+
+applyStrategy(strategy.st, portfolios = portfolio.st)
+```
+
+```{r}
+updatePortf(portfolio.st)
+updateAcct(account.st)
+updateEndEq(account.st)
+```
+
+
+# Analytics
+
+
+```{r}
+chart.Posn(portfolio.st, subset = paste0(init_date,"/"))
+```
+```{r}
+tstats <- tradeStats(portfolio.st)
+tstats %>%
+  as_tibble %>%
+  pivot_longer(cols = c(-Portfolio, -Symbol), names_to = "metric", values_to = "value") %>%
+  mutate_if(is.numeric, round, 2)
+```
+```{r}
+acct <- getAccount(account.st)
+xyplot(acct$summary)
+```
+```{r}
+plot(acct$summary$End.Eq, main = "Equity Curve")
+```
+
+```{r}
+acct$summary$End.Eq %>%
+  Return.calculate() %>%
+  charts.PerformanceSummary
+```
+
+```{r}
+PortfReturns(Account = account.st) %>%
+  table.AnnualizedReturns()
+```
+
+```{r}
+PortfReturns(Account = account.st)['2018-12-28/'] %>%
+  table.AnnualizedReturns()
+```
+
+Compare with buy and hold:
+
+```{r, fig.dim=c(5, 10)}
+strat_ret <- PortfReturns(Account = account.st)['2018-12-28/']
+bh_ret <- Return.calculate(SPY$adjusted['2018-12-28/'])
+
+names(strat_ret) <- "ARIMA+GARCH"
+names(bh_ret) <- "buy and hold"
+
+cbind(strat_ret, bh_ret) %>%
+  charts.PerformanceSummary(wealth.index=TRUE)
+```
+Analysis where strategy screwed up the most:
+
+```{r}
+chart.Posn(portfolio.st, subset = '2018-12-28/')
+```
+
+```{r}
+chart.Posn(portfolio.st, subset = '2019-09-25/2019-10-25')
+```
+
+```{r}
+chart.Posn(portfolio.st, subset = '2020-02-10/2020-04-25')
+```
+
+Sanity check that orders and signals are consistent:
+
+
+```{r}
+mktdata %>%
+  tk_tbl(rename_index = "date") %>%
+  select(-volume,-adjusted,-daily_return) %>%
+  filter(!is.na(arima_garch_indicator))
+```
+
+
+```{r}
+book <- getOrderBook(portfolio.st)
+book$`Port.ARIMA+GARCH`$SPY %>%
+  tk_tbl(rename_index = "Order.SubmitTime") %>%
+  select(
+    Order.SubmitTime,
+    Order.StatusTime,
+    Rule,
+    Order.Status,
+    Order.Qty,
+    Order.Price,
+    Order.Type,
+    Order.Side,
+    
+  )
+```
+
