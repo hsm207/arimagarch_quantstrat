@@ -1,7 +1,10 @@
 ---
 title: "ARIMA+GARCH Trading Strategy on the S&P500 Stock Market Index Using R"
-output: 
-  html_notebook: 
+output:
+  html_document:
+    toc: yes
+    df_print: paged
+  html_notebook:
     toc: yes
 ---
 
@@ -10,14 +13,6 @@ output:
 [ARIMA+GARCH Trading Strategy on the S&P500 Stock Market Index Using R](https://www.quantstart.com/articles/ARIMA-GARCH-Trading-Strategy-on-the-SP500-Stock-Market-Index-Using-R/)
 
 # Libraries
-
-```{r include=FALSE}
-install.packages("quantmod")
-install.packages("lattice")
-install.packages("timeSeries")
-install.packages("rugarch")
-install.packages("reticulate")
-```
 
 ```{r}
 library(quantmod)
@@ -34,8 +29,7 @@ library(reticulate)
 Get the differenced logarithmic return of the closing price of the S&P 500:
 
 ```{r}
-# getSymbols("^GSPC", from="1950-01-01")
-getSymbols("^GSPC", from="2017-01-01")
+getSymbols("^GSPC", from="2017-01-01", to="2021-05-02")
 spReturns = diff(log(Cl(GSPC)))
 spReturns[as.character(head(index(Cl(GSPC)),1))] = 0
 ```
